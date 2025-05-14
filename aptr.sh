@@ -592,7 +592,7 @@ upgrade_rolling_packages() {
     fi
 }
 
-system_upgrade() {
+upgrade_system() {
     log_info "Performing full system upgrade (stable + rolling packages)..."
     
     if [[ "$DRY_RUN" == true ]]; then
@@ -1229,7 +1229,7 @@ main() {
                 log_info "System upgrade cancelled"
                 exit 0
             fi
-            system_upgrade
+            upgrade_system
             ;;
         "roll")
             if [[ -z "$2" ]]; then
