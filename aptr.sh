@@ -136,7 +136,7 @@ validate_package_name() {
     fi
     
     # Prevent excessively long names (common in injection attacks)
-    if [[ ${#package} -gt 100 ]]; then
+    if [[ ${#package} -gt 127 ]]; then
         log_error "Package name too long: $package"
         return 1
     fi
