@@ -1,0 +1,708 @@
+#!/bin/bash
+
+# aptr - APT Rolling Package Manager
+# Version: 1.0.0
+# A sophisticated tool for managing mixed Debian systems with stable core and rolling development packages
+# Author: domwxyz
+# License: GPLv3
+
+set -e
+
+# Configuration constants
+readonly PROGRAM_NAME="aptr"
+readonly VERSION="1.0.0"
+readonly UNSTABLE_SOURCES="/etc/apt/sources.list.d/aptr-unstable.list"
+readonly PREFERENCES_FILE="/etc/apt/preferences.d/aptr-preferences"
+readonly ROLLING_PACKAGES_FILE="/var/lib/aptr/rolling-packages"
+readonly CONFIG_DIR="/var/lib/aptr"
+readonly LOCK_FILE="/var/run/aptr.lock"
+readonly LOG_FILE="/var/log/aptr.log"
+
+# Default configuration
+VERBOSE=false
+DRY_RUN=false
+FORCE=false
+
+# Colors for output (only if terminal supports it)
+if [[ -t 1 ]] && command -v tput &> /dev/null; then
+    readonly RED=$(tput setaf 1)
+    readonly GREEN=$(tput setaf 2)
+    readonly YELLOW=$(tput setaf 3)
+    readonly BLUE=$(tput setaf 4)
+    readonly BOLD=$(tput bold)
+    readonly NC=$(tput sgr0)
+else
+    readonly RED=""
+    readonly GREEN=""
+    readonly YELLOW=""
+    readonly BLUE=""
+    readonly BOLD=""
+    readonly NC=""
+fi
+
+# Logging functions
+log_to_file() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+    log_to_file "INFO: $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    log_to_file "SUCCESS: $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+    log_to_file "WARNING: $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+    log_to_file "ERROR: $1"
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo -e "${BLUE}[VERBOSE]${NC} $1"
+        log_to_file "VERBOSE: $1"
+    fi
+}
+
+# Utility functions
+cleanup() {
+    [[ -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"
+}
+
+# Set up signal handlers
+trap cleanup EXIT INT TERM
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This operation requires root privileges. Please run with sudo."
+        exit 1
+    fi
+}
+
+check_lock() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        local pid=$(cat "$LOCK_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            log_error "Another instance of $PROGRAM_NAME is already running (PID: $pid)"
+            exit 1
+        else
+            log_warning "Removing stale lock file"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    echo $$ > "$LOCK_FILE"
+}
+
+validate_package_name() {
+    local package="$1"
+    if [[ ! "$package" =~ ^[a-zA-Z0-9][a-zA-Z0-9+._-]*$ ]]; then
+        log_error "Invalid package name: $package"
+        return 1
+    fi
+    return 0
+}
+
+package_exists() {
+    local package="$1"
+    local source="${2:-}"
+    
+    if [[ -n "$source" ]]; then
+        apt-cache policy "$package" 2>/dev/null | grep -q "Candidate.*$source" || return 1
+    else
+        apt-cache show "$package" &>/dev/null || return 1
+    fi
+    return 0
+}
+
+confirm_action() {
+    local message="$1"
+    if [[ "$FORCE" == true ]]; then
+        return 0
+    fi
+    
+    echo -n -e "${YELLOW}$message${NC} [y/N]: "
+    read -r response
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
+# Configuration management
+setup_config() {
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        log_verbose "Created configuration directory: $CONFIG_DIR"
+    fi
+    
+    if [[ ! -f "$ROLLING_PACKAGES_FILE" ]]; then
+        touch "$ROLLING_PACKAGES_FILE"
+        chmod 644 "$ROLLING_PACKAGES_FILE"
+        log_verbose "Created rolling packages tracking file: $ROLLING_PACKAGES_FILE"
+    fi
+    
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 644 "$LOG_FILE"
+}
+
+detect_debian_codename() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        echo "${VERSION_CODENAME:-bookworm}"
+    else
+        echo "bookworm"  # fallback
+    fi
+}
+
+setup_unstable_sources() {
+    if [[ -f "$UNSTABLE_SOURCES" ]]; then
+        log_verbose "Unstable sources already configured"
+        return 0
+    fi
+    
+    log_info "Setting up unstable sources..."
+    
+    # Detect current mirror and architecture
+    local current_sources="/etc/apt/sources.list"
+    local debian_mirror=""
+    local components="main contrib non-free non-free-firmware"
+    
+    # Try to detect mirror from existing sources
+    if [[ -f "$current_sources" ]]; then
+        debian_mirror=$(grep -E "^deb\s+" "$current_sources" | head -1 | awk '{print $2}')
+    fi
+    
+    # Fallback to default mirrors
+    if [[ -z "$debian_mirror" ]] || [[ "$debian_mirror" == "cdrom:"* ]]; then
+        debian_mirror="https://deb.debian.org/debian"
+        log_warning "Could not detect mirror, using default: $debian_mirror"
+    fi
+    
+    # Create unstable sources
+    cat > "$UNSTABLE_SOURCES" << EOF
+# APT Rolling Package Manager - Unstable Sources
+# Auto-generated by $PROGRAM_NAME v$VERSION
+# Do not edit manually - managed by $PROGRAM_NAME
+
+deb $debian_mirror unstable $components
+deb-src $debian_mirror unstable $components
+EOF
+    
+    chmod 644 "$UNSTABLE_SOURCES"
+    log_success "Created unstable sources file"
+}
+
+setup_preferences() {
+    if [[ -f "$PREFERENCES_FILE" ]]; then
+        log_verbose "APT preferences already configured"
+        return 0
+    fi
+    
+    log_info "Setting up APT preferences for intelligent pinning..."
+    
+    local stable_codename=$(detect_debian_codename)
+    
+    cat > "$PREFERENCES_FILE" << EOF
+# APT Rolling Package Manager - Preferences
+# Auto-generated by $PROGRAM_NAME v$VERSION
+# Do not edit manually - managed by $PROGRAM_NAME
+
+# Default: strongly prefer stable packages
+Package: *
+Pin: release a=$stable_codename
+Pin-Priority: 990
+
+# Secondary preference for stable
+Package: *
+Pin: release a=stable
+Pin-Priority: 900
+
+# Unstable packages have very low priority by default
+Package: *
+Pin: release a=unstable
+Pin-Priority: 100
+
+# Prevent accidental installation from experimental
+Package: *
+Pin: release a=experimental
+Pin-Priority: 50
+EOF
+    
+    chmod 644 "$PREFERENCES_FILE"
+    log_success "Created APT preferences file with intelligent pinning"
+}
+
+# Core functionality
+init_system() {
+    log_info "Initializing $PROGRAM_NAME v$VERSION..."
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "[DRY RUN] Would initialize system configuration"
+        return 0
+    fi
+    
+    setup_config
+    setup_unstable_sources
+    setup_preferences
+    
+    log_info "Updating package lists..."
+    if ! apt update; then
+        log_error "Failed to update package lists"
+        return 1
+    fi
+    
+    log_success "System successfully initialized for mixed package management"
+    log_info "You can now use '$PROGRAM_NAME install <package>' to install from unstable"
+}
+
+add_to_rolling_list() {
+    local package="$1"
+    
+    if ! grep -q "^$package$" "$ROLLING_PACKAGES_FILE" 2>/dev/null; then
+        echo "$package" >> "$ROLLING_PACKAGES_FILE"
+        log_verbose "Added $package to rolling packages list"
+        return 0
+    fi
+    return 1
+}
+
+remove_from_rolling_list() {
+    local package="$1"
+    
+    if [[ -f "$ROLLING_PACKAGES_FILE" ]]; then
+        sed -i "/^${package}$/d" "$ROLLING_PACKAGES_FILE"
+        log_verbose "Removed $package from rolling packages list"
+    fi
+}
+
+create_package_preference() {
+    local package="$1"
+    local priority="${2:-990}"
+    local package_pref_file="/etc/apt/preferences.d/aptr-${package}"
+    
+    cat > "$package_pref_file" << EOF
+# APT Rolling Package: $package
+# Managed by $PROGRAM_NAME - do not edit manually
+
+Package: $package
+Pin: release a=unstable
+Pin-Priority: $priority
+
+# Also pin related packages with same name prefix
+Package: ${package}*
+Pin: release a=unstable
+Pin-Priority: $priority
+EOF
+    
+    chmod 644 "$package_pref_file"
+    log_verbose "Created preference file for $package"
+}
+
+remove_package_preference() {
+    local package="$1"
+    local package_pref_file="/etc/apt/preferences.d/aptr-${package}"
+    
+    if [[ -f "$package_pref_file" ]]; then
+        rm "$package_pref_file"
+        log_verbose "Removed preference file for $package"
+    fi
+}
+
+install_package() {
+    local package="$1"
+    local from_unstable="${2:-true}"
+    
+    validate_package_name "$package" || return 1
+    
+    if [[ "$from_unstable" == true ]]; then
+        log_info "Installing $package from unstable..."
+        
+        # Check if package exists in unstable
+        if ! package_exists "$package"; then
+            log_warning "Package '$package' not found. Updating package lists..."
+            apt update
+            if ! package_exists "$package"; then
+                log_error "Package '$package' not found in any repository"
+                return 1
+            fi
+        fi
+        
+        if [[ "$DRY_RUN" == true ]]; then
+            log_info "[DRY RUN] Would install $package from unstable"
+            return 0
+        fi
+        
+        # Add to rolling list and create preference
+        add_to_rolling_list "$package"
+        create_package_preference "$package"
+        
+        # Install with specific target
+        if DEBIAN_FRONTEND=noninteractive apt install -t unstable -y "$package"; then
+            log_success "Successfully installed $package from unstable"
+        else
+            log_error "Failed to install $package from unstable"
+            remove_from_rolling_list "$package"
+            remove_package_preference "$package"
+            return 1
+        fi
+    else
+        log_info "Installing $package from stable..."
+        
+        if [[ "$DRY_RUN" == true ]]; then
+            log_info "[DRY RUN] Would install $package from stable"
+            return 0
+        fi
+        
+        if DEBIAN_FRONTEND=noninteractive apt install -y "$package"; then
+            log_success "Successfully installed $package from stable"
+        else
+            log_error "Failed to install $package from stable"
+            return 1
+        fi
+    fi
+}
+
+list_rolling_packages() {
+    if [[ ! -f "$ROLLING_PACKAGES_FILE" || ! -s "$ROLLING_PACKAGES_FILE" ]]; then
+        log_info "No rolling packages configured"
+        return 0
+    fi
+    
+    echo -e "${BOLD}Rolling Packages:${NC}"
+    echo -e "${BOLD}================${NC}"
+    
+    local count=0
+    while IFS= read -r package; do
+        [[ -z "$package" ]] && continue
+        ((count++))
+        
+        # Get current version info
+        local version=""
+        local available=""
+        if command -v dpkg-query &>/dev/null && dpkg-query -W -f='${Version}' "$package" 2>/dev/null; then
+            version=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null || echo "Not installed")
+            available=$(apt-cache policy "$package" 2>/dev/null | grep -A1 "unstable" | tail -1 | awk '{print $1}' || echo "Unknown")
+        fi
+        
+        printf "%-20s %s\n" "$package" "${version:0:40}"
+        if [[ "$VERBOSE" == true && -n "$available" && "$available" != "Unknown" ]]; then
+            printf "%-20s └─ Available: %s\n" "" "$available"
+        fi
+    done < "$ROLLING_PACKAGES_FILE"
+    
+    echo
+    log_info "Total rolling packages: $count"
+}
+
+upgrade_rolling_packages() {
+    if [[ ! -f "$ROLLING_PACKAGES_FILE" || ! -s "$ROLLING_PACKAGES_FILE" ]]; then
+        log_info "No rolling packages to upgrade"
+        return 0
+    fi
+    
+    log_info "Updating package lists..."
+    apt update
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "[DRY RUN] Would upgrade the following rolling packages:"
+        cat "$ROLLING_PACKAGES_FILE"
+        return 0
+    fi
+    
+    log_info "Upgrading rolling packages..."
+    local failed_packages=()
+    local upgraded_count=0
+    
+    while IFS= read -r package; do
+        [[ -z "$package" ]] && continue
+        
+        log_verbose "Checking $package for updates..."
+        if DEBIAN_FRONTEND=noninteractive apt install -t unstable -y "$package"; then
+            ((upgraded_count++))
+            log_success "Upgraded $package"
+        else
+            failed_packages+=("$package")
+            log_warning "Failed to upgrade $package"
+        fi
+    done < "$ROLLING_PACKAGES_FILE"
+    
+    if [[ ${#failed_packages[@]} -eq 0 ]]; then
+        log_success "All $upgraded_count rolling packages upgraded successfully"
+    else
+        log_warning "Upgraded $upgraded_count packages, but ${#failed_packages[@]} failed:"
+        printf '  - %s\n' "${failed_packages[@]}"
+    fi
+}
+
+unroll_package() {
+    local package="$1"
+    
+    validate_package_name "$package" || return 1
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "[DRY RUN] Would remove $package from rolling status"
+        return 0
+    fi
+    
+    # Check if package is actually in rolling list
+    if ! grep -q "^$package$" "$ROLLING_PACKAGES_FILE" 2>/dev/null; then
+        log_warning "Package '$package' is not configured as rolling"
+        return 1
+    fi
+    
+    remove_from_rolling_list "$package"
+    remove_package_preference "$package"
+    
+    log_success "Removed $package from rolling status"
+    log_info "The package remains installed. Use 'apt remove $package' to uninstall it."
+    log_info "Use 'apt update && apt upgrade' to potentially downgrade to stable version."
+}
+
+search_packages() {
+    local query="$1"
+    
+    if [[ -z "$query" ]]; then
+        log_error "Search query required"
+        return 1
+    fi
+    
+    log_info "Searching for packages matching '$query'..."
+    
+    # Search in both stable and unstable
+    echo -e "${BOLD}Stable packages:${NC}"
+    apt-cache search "$query" | grep -v "^WARNING" | head -10
+    
+    echo
+    echo -e "${BOLD}Unstable packages:${NC}"
+    apt-cache search -t unstable "$query" 2>/dev/null | grep -v "^WARNING" | head -10 || \
+    apt-cache search "$query" | grep -v "^WARNING" | head -10
+}
+
+show_status() {
+    echo -e "${BOLD}$PROGRAM_NAME Status:${NC}"
+    echo -e "${BOLD}===================${NC}"
+    
+    # Check if initialized
+    if [[ -f "$UNSTABLE_SOURCES" && -f "$PREFERENCES_FILE" ]]; then
+        echo -e "Status: ${GREEN}Initialized${NC}"
+    else
+        echo -e "Status: ${RED}Not initialized${NC} (run '$PROGRAM_NAME init')"
+        return
+    fi
+    
+    # Show sources status
+    if [[ -f "$UNSTABLE_SOURCES" ]]; then
+        echo -e "Unstable sources: ${GREEN}Configured${NC}"
+    else
+        echo -e "Unstable sources: ${RED}Missing${NC}"
+    fi
+    
+    # Show preferences status
+    if [[ -f "$PREFERENCES_FILE" ]]; then
+        echo -e "APT preferences: ${GREEN}Configured${NC}"
+    else
+        echo -e "APT preferences: ${RED}Missing${NC}"
+    fi
+    
+    # Count rolling packages
+    local rolling_count=0
+    if [[ -f "$ROLLING_PACKAGES_FILE" ]]; then
+        rolling_count=$(grep -c "^[^[:space:]]*$" "$ROLLING_PACKAGES_FILE" 2>/dev/null || echo 0)
+    fi
+    echo "Rolling packages: $rolling_count"
+    
+    # Show last update
+    if [[ -f "$LOG_FILE" ]]; then
+        local last_update=$(grep "SUCCESS.*upgrade" "$LOG_FILE" | tail -1 | cut -d' ' -f1-2 | tr -d '[]')
+        if [[ -n "$last_update" ]]; then
+            echo "Last upgrade: $last_update"
+        fi
+    fi
+}
+
+# Help function
+show_help() {
+    cat << EOF
+${BOLD}$PROGRAM_NAME v$VERSION - APT Rolling Package Manager${NC}
+
+A tool for managing mixed Debian systems with stable core packages and
+rolling development packages from unstable.
+
+${BOLD}USAGE:${NC}
+    $PROGRAM_NAME [OPTIONS] <command> [arguments]
+
+${BOLD}OPTIONS:${NC}
+    -v, --verbose       Enable verbose output
+    -n, --dry-run       Show what would be done without executing
+    -f, --force         Skip confirmation prompts
+    -h, --help          Show this help message
+    --version           Show version information
+
+${BOLD}COMMANDS:${NC}
+    init                Initialize system for mixed package management
+    install <pkg>       Install package from unstable (rolling)
+    install-stable <pkg> Install package from stable
+    list               List all rolling packages with versions
+    upgrade            Upgrade all rolling packages to latest unstable
+    unroll <pkg>       Remove package from rolling status
+    search <query>     Search for packages in both stable and unstable
+    status             Show system status and configuration
+    help               Show this help message
+
+${BOLD}EXAMPLES:${NC}
+    $PROGRAM_NAME init                    # Initialize the system
+    $PROGRAM_NAME install python3-dev    # Install python3-dev from unstable
+    $PROGRAM_NAME install-stable nginx   # Install nginx from stable
+    $PROGRAM_NAME list                   # Show all rolling packages
+    $PROGRAM_NAME upgrade                # Upgrade all rolling packages
+    $PROGRAM_NAME search golang          # Search for golang packages
+    $PROGRAM_NAME unroll python3-dev     # Stop rolling python3-dev
+    $PROGRAM_NAME --dry-run upgrade      # Preview upgrade actions
+
+${BOLD}FILES:${NC}
+    $UNSTABLE_SOURCES    Unstable repository configuration
+    $PREFERENCES_FILE             APT pinning preferences
+    $ROLLING_PACKAGES_FILE        List of rolling packages
+    $LOG_FILE                Log file
+
+${BOLD}NOTES:${NC}
+    - Rolling packages are automatically pinned to unstable with high priority
+    - Stable packages maintain higher priority for system stability
+    - Use '$PROGRAM_NAME status' to check system configuration
+    - Logs are written to $LOG_FILE
+
+For more information, visit: https://github.com/yourusername/aptr
+EOF
+}
+
+show_version() {
+    echo "$PROGRAM_NAME v$VERSION"
+}
+
+# Parse command line options
+parse_options() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    # Return remaining arguments
+    echo "$@"
+}
+
+# Main function
+main() {
+    # Parse options and get remaining arguments
+    local args
+    args=$(parse_options "$@")
+    set -- $args
+    
+    local command="${1:-help}"
+    
+    # Set up lock for operations that modify system
+    case "$command" in
+        init|install|install-stable|upgrade|unroll)
+            check_root
+            check_lock
+            ;;
+    esac
+    
+    case "$command" in
+        "init")
+            init_system
+            ;;
+        "install")
+            if [[ -z "$2" ]]; then
+                log_error "Package name required for install command"
+                exit 1
+            fi
+            install_package "$2" true
+            ;;
+        "install-stable")
+            if [[ -z "$2" ]]; then
+                log_error "Package name required for install-stable command"
+                exit 1
+            fi
+            install_package "$2" false
+            ;;
+        "list")
+            list_rolling_packages
+            ;;
+        "upgrade")
+            if ! confirm_action "This will upgrade all rolling packages from unstable. Continue?"; then
+                log_info "Upgrade cancelled"
+                exit 0
+            fi
+            upgrade_rolling_packages
+            ;;
+        "unroll")
+            if [[ -z "$2" ]]; then
+                log_error "Package name required for unroll command"
+                exit 1
+            fi
+            unroll_package "$2"
+            ;;
+        "search")
+            if [[ -z "$2" ]]; then
+                log_error "Search query required for search command"
+                exit 1
+            fi
+            search_packages "$2"
+            ;;
+        "status")
+            show_status
+            ;;
+        "help"|"-h"|"--help")
+            show_help
+            ;;
+        *)
+            log_error "Unknown command: $command"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# Ensure we're on a Debian-based system
+if ! command -v apt &> /dev/null; then
+    log_error "This tool requires APT package manager (Debian/Ubuntu)"
+    exit 1
+fi
+
+# Run main function with all arguments
+main "$@"
