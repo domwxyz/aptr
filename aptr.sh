@@ -468,6 +468,79 @@ upgrade_rolling_packages() {
     fi
 }
 
+roll_package() {
+    local package="$1"
+    
+    validate_package_name "$package" || return 1
+    
+    # Check if package is installed
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
+        log_error "Package '$package' is not currently installed"
+        log_info "Use '$PROGRAM_NAME install $package' to install from unstable"
+        return 1
+    fi
+    
+    # Check if already rolling
+    if grep -q "^$package$" "$ROLLING_PACKAGES_FILE" 2>/dev/null; then
+        log_warning "Package '$package' is already configured as rolling"
+        return 1
+    fi
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "[DRY RUN] Would convert $package to rolling and upgrade from unstable"
+        return 0
+    fi
+    
+    # Check if package exists in unstable
+    log_info "Checking if $package is available in unstable..."
+    if ! package_exists "$package"; then
+        log_warning "Package '$package' not found. Updating package lists..."
+        apt update
+        if ! package_exists "$package"; then
+            log_error "Package '$package' not found in any repository"
+            return 1
+        fi
+    fi
+    
+    # Get current and available versions for user confirmation
+    local current_version=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null)
+    local unstable_version=$(apt-cache policy "$package" 2>/dev/null | grep -A1 "unstable" | tail -1 | awk '{print $1}' || echo "Unknown")
+    
+    log_info "Current version: $current_version"
+    log_info "Unstable version: $unstable_version"
+    
+    if ! confirm_action "Convert $package to rolling status and upgrade to unstable?"; then
+        log_info "Operation cancelled"
+        return 0
+    fi
+    
+    log_info "Converting $package to rolling status..."
+    
+    # Add to rolling list and create preference
+    add_to_rolling_list "$package"
+    create_package_preference "$package"
+    
+    # Build apt command with optional -y flag
+    local apt_cmd="apt install -t unstable"
+    if [[ "$YES" == true ]]; then
+        apt_cmd="$apt_cmd -y"
+    fi
+    
+    # Upgrade to unstable version
+    log_info "Upgrading $package to unstable version..."
+    if DEBIAN_FRONTEND=noninteractive $apt_cmd "$package"; then
+        log_success "Successfully converted $package to rolling and upgraded from unstable"
+        log_info "Package $package will now be updated during '$PROGRAM_NAME upgrade' operations"
+    else
+        log_error "Failed to upgrade $package from unstable"
+        # Rollback changes
+        log_warning "Rolling back changes due to upgrade failure..."
+        remove_from_rolling_list "$package"
+        remove_package_preference "$package"
+        return 1
+    fi
+}
+
 unroll_package() {
     local package="$1"
     
@@ -580,13 +653,14 @@ ${BOLD}COMMANDS:${NC}
     install -s <pkg>    Install package from stable (equivalent to apt install)
     list               List all rolling packages with versions
     upgrade            Upgrade all rolling packages to latest unstable
+    roll <pkg>         Convert installed package from stable to rolling (unstable)
     unroll <pkg>       Remove package from rolling status
     search <query>     Search for packages in both stable and unstable
     status             Show system status and configuration
     help               Show this help message
 
 ${BOLD}EXAMPLES:${NC}
-    $PROGRAM_NAME init                      # Initialize the system
+    $PROGRAM_NAME init                     # Initialize the system
     $PROGRAM_NAME install python3-dev      # Install python3-dev from unstable
     $PROGRAM_NAME install -s nginx         # Install nginx from stable
     $PROGRAM_NAME -y install golang        # Install golang from unstable (no prompts)
@@ -594,6 +668,7 @@ ${BOLD}EXAMPLES:${NC}
     $PROGRAM_NAME list                     # Show all rolling packages
     $PROGRAM_NAME -y upgrade               # Upgrade all rolling packages (no prompts)
     $PROGRAM_NAME search golang            # Search for golang packages
+    $PROGRAM_NAME roll python3-dev         # Convert python3-dev to rolling
     $PROGRAM_NAME unroll python3-dev       # Stop rolling python3-dev
     $PROGRAM_NAME --dry-run upgrade        # Preview upgrade actions
 
@@ -718,6 +793,13 @@ main() {
                 exit 0
             fi
             upgrade_rolling_packages
+            ;;
+        "roll")
+            if [[ -z "$2" ]]; then
+                log_error "Package name required for roll command"
+                exit 1
+            fi
+            roll_package "$2"
             ;;
         "unroll")
             if [[ -z "$2" ]]; then

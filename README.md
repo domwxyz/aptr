@@ -50,6 +50,7 @@ sudo aptr upgrade
 - `install <package>` - Install package from unstable (default) or stable with --stable flag
 - `list` - Display all rolling packages with version information
 - `upgrade` - Update all rolling packages to latest unstable versions
+- `roll <package>` - Convert installed package from stable to rolling (unstable)
 - `unroll <package>` - Remove package from rolling status
 - `search <query>` - Search packages in both stable and unstable repositories
 - `status` - Show system configuration and package statistics
@@ -78,6 +79,7 @@ sudo aptr --dry-run upgrade  # Preview changes
 
 # Package management
 aptr search docker
+sudo aptr roll --dry-run prometheus
 sudo aptr unroll python3-dev
 ```
 
