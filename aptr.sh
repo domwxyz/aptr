@@ -101,15 +101,40 @@ check_lock() {
             rm -f "$LOCK_FILE"
         fi
     fi
-    echo $$ > "$LOCK_FILE"
+
+    (set -C; echo $$ > "$LOCK_FILE") 2>/dev/null || {
+        log_error "Failed to create lock file (another instance started concurrently)"
+        exit 1
+    }
 }
 
 validate_package_name() {
     local package="$1"
+    
+    # Only allow standard package name characters
     if [[ ! "$package" =~ ^[a-zA-Z0-9][a-zA-Z0-9+._-]*$ ]]; then
         log_error "Invalid package name: $package"
         return 1
     fi
+    
+    # Prevent excessively long names (common in injection attacks)
+    if [[ ${#package} -gt 100 ]]; then
+        log_error "Package name too long: $package"
+        return 1
+    fi
+    
+    # Block dangerous characters/sequences
+    if [[ "$package" == *".."* ]] || [[ "$package" == *"/"* ]] || [[ "$package" == *";"* ]] || [[ "$package" == *"|"* ]]; then
+        log_error "Package name contains invalid characters: $package"
+        return 1
+    fi
+
+    # Additional checks for problematic patterns
+    if [[ "$package" =~ (^-|--|-$|\.\.|^\.|\.$) ]]; then
+        log_error "Package name contains invalid patterns: $package"
+        return 1
+    fi
+    
     return 0
 }
 
@@ -159,12 +184,34 @@ setup_config() {
 }
 
 detect_debian_codename() {
+    local codename=""
+    
+    # Try multiple sources for codename detection
     if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        echo "${VERSION_CODENAME:-bookworm}"
-    else
-        echo "bookworm"  # fallback
+        # shellcheck source=/etc/os-release
+        codename=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
     fi
+    
+    # Fallback to lsb_release
+    if [[ -z "$codename" ]] && command -v lsb_release &>/dev/null; then
+        codename=$(lsb_release -cs 2>/dev/null || true)
+    fi
+    
+    # Fallback to debian_version
+    if [[ -z "$codename" ]] && [[ -f /etc/debian_version ]]; then
+        local version=$(cat /etc/debian_version)
+        case "$version" in
+            12*) codename="bookworm" ;;
+            11*) codename="bullseye" ;;
+            10*) codename="buster" ;;
+            9*) codename="stretch" ;;
+            8*) codename="jessie" ;;
+            *) codename="bookworm" ;;  # Default for unknown versions
+        esac
+    fi
+    
+    # Final fallback
+    echo "${codename:-bookworm}"
 }
 
 setup_unstable_sources() {
@@ -298,7 +345,19 @@ remove_from_rolling_list() {
 create_package_preference() {
     local package="$1"
     local priority="${2:-990}"
-    local package_pref_file="/etc/apt/preferences.d/aptr-${package}"
+    
+    # Validate package name first
+    validate_package_name "$package" || return 1
+    
+    # Sanitize package name for filename (remove any remaining unsafe chars)
+    local safe_package="${package//[^a-zA-Z0-9+._-]/}"
+    local package_pref_file="/etc/apt/preferences.d/aptr-${safe_package}"
+    
+    # Double-check the final path is safe
+    if [[ "$package_pref_file" != "/etc/apt/preferences.d/aptr-"* ]]; then
+        log_error "Invalid preference file path generated"
+        return 1
+    fi
     
     cat > "$package_pref_file" << EOF
 # APT Rolling Package: $package
@@ -320,7 +379,17 @@ EOF
 
 remove_package_preference() {
     local package="$1"
-    local package_pref_file="/etc/apt/preferences.d/aptr-${package}"
+    
+    # Validate and sanitize
+    validate_package_name "$package" || return 1
+    local safe_package="${package//[^a-zA-Z0-9+._-]/}"
+    local package_pref_file="/etc/apt/preferences.d/aptr-${safe_package}"
+    
+    # Verify path safety
+    if [[ "$package_pref_file" != "/etc/apt/preferences.d/aptr-"* ]]; then
+        log_error "Invalid preference file path"
+        return 1
+    fi
     
     if [[ -f "$package_pref_file" ]]; then
         rm "$package_pref_file"
@@ -1121,6 +1190,16 @@ main() {
         init|install|upgrade|system-upgrade|roll|unroll)
             check_root
             check_lock
+            ;;
+    esac
+
+    # Validate package names for commands that use them
+    case "$command" in
+        "install"|"roll"|"unroll"|"search")
+            if [[ -n "$2" ]] && ! validate_package_name "$2"; then
+                log_error "Invalid package name: $2"
+                exit 1
+            fi
             ;;
     esac
     
