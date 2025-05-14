@@ -168,6 +168,21 @@ package_exists() {
     return 0
 }
 
+is_virtual_package() {
+    local package="$1"
+    
+    # Virtual packages show "Package: <name>" followed by "Reverse Depends:" but no "Description:"
+    if apt-cache show "$package" 2>/dev/null | grep -q "^Package: $package$"; then
+        # Real package found
+        return 1
+    else
+        # Check if it's provided by other packages (virtual)
+        apt-cache search --names-only "^$package$" 2>/dev/null | grep -q "^$package " && return 1
+        apt-cache showpkg "$package" 2>/dev/null | grep -q "^Reverse Provides:" && return 0
+        return 1
+    fi
+}
+
 confirm_action() {
     local message="$1"
     if [[ "$FORCE" == true ]]; then
@@ -425,6 +440,11 @@ pin_dependencies() {
         # Skip if already tracked as a main rolling package
         if grep -qx "$dep" "$ROLLING_PACKAGES_FILE"; then
             log_verbose "Dependency $dep already tracked as rolling package"
+            continue
+        fi
+
+        if is_virtual_package "$dep"; then
+            log_verbose "Skipping virtual package dependency: $dep"
             continue
         fi
         
