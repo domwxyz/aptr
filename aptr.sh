@@ -22,6 +22,8 @@ readonly LOG_FILE="/var/log/aptr.log"
 VERBOSE=false
 DRY_RUN=false
 FORCE=false
+YES=false
+STABLE=false
 
 # Colors for output (only if terminal supports it)
 if [[ -t 1 ]] && command -v tput &> /dev/null; then
@@ -317,7 +319,14 @@ remove_package_preference() {
 
 install_package() {
     local package="$1"
-    local from_unstable="${2:-true}"
+    local from_unstable="${2:-auto}"
+    
+    # Determine install source based on flags
+    if [[ "$STABLE" == true ]]; then
+        from_unstable=false
+    elif [[ "$from_unstable" == "auto" ]]; then
+        from_unstable=true  # Default behavior is unstable
+    fi
     
     validate_package_name "$package" || return 1
     
@@ -343,8 +352,14 @@ install_package() {
         add_to_rolling_list "$package"
         create_package_preference "$package"
         
+        # Build apt command with optional -y flag
+        local apt_cmd="apt install -t unstable"
+        if [[ "$YES" == true ]]; then
+            apt_cmd="$apt_cmd -y"
+        fi
+        
         # Install with specific target
-        if DEBIAN_FRONTEND=noninteractive apt install -t unstable -y "$package"; then
+        if DEBIAN_FRONTEND=noninteractive $apt_cmd "$package"; then
             log_success "Successfully installed $package from unstable"
         else
             log_error "Failed to install $package from unstable"
@@ -360,7 +375,13 @@ install_package() {
             return 0
         fi
         
-        if DEBIAN_FRONTEND=noninteractive apt install -y "$package"; then
+        # Build apt command with optional -y flag
+        local apt_cmd="apt install"
+        if [[ "$YES" == true ]]; then
+            apt_cmd="$apt_cmd -y"
+        fi
+        
+        if DEBIAN_FRONTEND=noninteractive $apt_cmd "$package"; then
             log_success "Successfully installed $package from stable"
         else
             log_error "Failed to install $package from stable"
@@ -420,11 +441,17 @@ upgrade_rolling_packages() {
     local failed_packages=()
     local upgraded_count=0
     
+    # Build apt command with optional -y flag
+    local apt_cmd="apt install -t unstable"
+    if [[ "$YES" == true ]]; then
+        apt_cmd="$apt_cmd -y"
+    fi
+    
     while IFS= read -r package; do
         [[ -z "$package" ]] && continue
         
         log_verbose "Checking $package for updates..."
-        if DEBIAN_FRONTEND=noninteractive apt install -t unstable -y "$package"; then
+        if DEBIAN_FRONTEND=noninteractive $apt_cmd "$package"; then
             ((upgraded_count++))
             log_success "Upgraded $package"
         else
@@ -542,13 +569,15 @@ ${BOLD}OPTIONS:${NC}
     -v, --verbose       Enable verbose output
     -n, --dry-run       Show what would be done without executing
     -f, --force         Skip confirmation prompts
+    -y, --yes           Automatic yes to prompts (equivalent to apt -y)
+    -s, --stable        Install from stable branch (use with install command)
     -h, --help          Show this help message
     --version           Show version information
 
 ${BOLD}COMMANDS:${NC}
     init                Initialize system for mixed package management
-    install <pkg>       Install package from unstable (rolling)
-    install-stable <pkg> Install package from stable
+    install <pkg>       Install package from unstable (default)
+    install -s <pkg>    Install package from stable (equivalent to apt install)
     list               List all rolling packages with versions
     upgrade            Upgrade all rolling packages to latest unstable
     unroll <pkg>       Remove package from rolling status
@@ -557,14 +586,16 @@ ${BOLD}COMMANDS:${NC}
     help               Show this help message
 
 ${BOLD}EXAMPLES:${NC}
-    $PROGRAM_NAME init                    # Initialize the system
-    $PROGRAM_NAME install python3-dev    # Install python3-dev from unstable
-    $PROGRAM_NAME install-stable nginx   # Install nginx from stable
-    $PROGRAM_NAME list                   # Show all rolling packages
-    $PROGRAM_NAME upgrade                # Upgrade all rolling packages
-    $PROGRAM_NAME search golang          # Search for golang packages
-    $PROGRAM_NAME unroll python3-dev     # Stop rolling python3-dev
-    $PROGRAM_NAME --dry-run upgrade      # Preview upgrade actions
+    $PROGRAM_NAME init                      # Initialize the system
+    $PROGRAM_NAME install python3-dev      # Install python3-dev from unstable
+    $PROGRAM_NAME install -s nginx         # Install nginx from stable
+    $PROGRAM_NAME -y install golang        # Install golang from unstable (no prompts)
+    $PROGRAM_NAME install --stable systemd # Install systemd from stable
+    $PROGRAM_NAME list                     # Show all rolling packages
+    $PROGRAM_NAME -y upgrade               # Upgrade all rolling packages (no prompts)
+    $PROGRAM_NAME search golang            # Search for golang packages
+    $PROGRAM_NAME unroll python3-dev       # Stop rolling python3-dev
+    $PROGRAM_NAME --dry-run upgrade        # Preview upgrade actions
 
 ${BOLD}FILES:${NC}
     $UNSTABLE_SOURCES    Unstable repository configuration
@@ -586,43 +617,68 @@ show_version() {
     echo "$PROGRAM_NAME v$VERSION"
 }
 
-# Parse command line options
+process_flag() {
+    case "$1" in
+        -v|--verbose)
+            VERBOSE=true
+            return 0
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            return 0
+            ;;
+        -f|--force)
+            FORCE=true
+            return 0
+            ;;
+        -y|--yes)
+            YES=true
+            return 0
+            ;;
+        -s|--stable)
+            STABLE=true
+            return 0
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --version)
+            show_version
+            exit 0
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            return 1  # Not a flag
+            ;;
+    esac
+}
+
 parse_options() {
+    local command=""
+    local args=()
+    
+    # Single pass through all arguments
     while [[ $# -gt 0 ]]; do
-        case $1 in
-            -v|--verbose)
-                VERBOSE=true
-                shift
-                ;;
-            -n|--dry-run)
-                DRY_RUN=true
-                shift
-                ;;
-            -f|--force)
-                FORCE=true
-                shift
-                ;;
-            -h|--help)
-                show_help
-                exit 0
-                ;;
-            --version)
-                show_version
-                exit 0
-                ;;
-            -*)
-                log_error "Unknown option: $1"
-                show_help
-                exit 1
-                ;;
-            *)
-                break
-                ;;
-        esac
+        if process_flag "$1"; then
+            # Flag was processed, continue
+            shift
+        else
+            # Not a flag - must be command or argument
+            if [[ -z "$command" ]]; then
+                command="$1"
+            else
+                args+=("$1")
+            fi
+            shift
+        fi
     done
     
-    # Return remaining arguments
-    echo "$@"
+    echo "$command" "${args[@]}"
 }
 
 # Main function
@@ -636,7 +692,7 @@ main() {
     
     # Set up lock for operations that modify system
     case "$command" in
-        init|install|install-stable|upgrade|unroll)
+        init|install|upgrade|unroll)
             check_root
             check_lock
             ;;
@@ -651,14 +707,7 @@ main() {
                 log_error "Package name required for install command"
                 exit 1
             fi
-            install_package "$2" true
-            ;;
-        "install-stable")
-            if [[ -z "$2" ]]; then
-                log_error "Package name required for install-stable command"
-                exit 1
-            fi
-            install_package "$2" false
+            install_package "$2"
             ;;
         "list")
             list_rolling_packages
