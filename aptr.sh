@@ -197,23 +197,40 @@ confirm_action() {
 # Configuration management
 setup_config() {
     if [[ ! -d "$CONFIG_DIR" ]]; then
-        mkdir -p "$CONFIG_DIR"
+        if ! mkdir -p "$CONFIG_DIR"; then
+            log_error "Failed to create configuration directory"
+            return 1
+        fi
         log_verbose "Created configuration directory: $CONFIG_DIR"
     fi
     
     # Create all necessary files
     for file in "$ROLLING_PACKAGES_FILE" "$ROLLING_DEPS_FILE"; do
         if [[ ! -f "$file" ]]; then
-            touch "$file"
+            if ! touch "$file"; then
+                log_error "Failed to create $(basename "$file")"
+                return 1
+            fi
             chmod 644 "$file"
             log_verbose "Created $(basename "$file")"
         fi
     done
     
     # Ensure log directory exists
-    mkdir -p "$(dirname "$LOG_FILE")"
-    touch "$LOG_FILE"
-    chmod 644 "$LOG_FILE"
+    log_dir=$(dirname "$LOG_FILE")
+    if ! mkdir -p "$log_dir"; then
+        echo "Warning: Failed to create log directory $log_dir" >&2
+        echo "Continuing without file logging..." >&2
+        LOG_FILE="/dev/null"
+    fi
+    if [[ "$LOG_FILE" != "/dev/null" ]]; then
+        if ! touch "$LOG_FILE" 2>/dev/null; then
+            echo "Warning: Cannot create log file $LOG_FILE" >&2
+            LOG_FILE="/dev/null"
+        else
+            chmod 644 "$LOG_FILE"
+        fi
+    fi
 }
 
 detect_debian_codename() {
