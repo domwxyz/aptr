@@ -684,7 +684,7 @@ ${BOLD}NOTES:${NC}
     - Use '$PROGRAM_NAME status' to check system configuration
     - Logs are written to $LOG_FILE
 
-For more information, visit: https://github.com/yourusername/aptr
+For more information, visit: https://github.com/domwxyz/aptr
 EOF
 }
 
