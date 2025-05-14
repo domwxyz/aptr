@@ -11,9 +11,10 @@ A tool for managing mixed Debian systems with stable core packages and selective
 - Automatic APT preferences configuration with intelligent pinning
 - Selective package tracking from unstable repository
 - Rolling update management for chosen packages
+- Smart dependency management - automatically pins dependencies
 - Dry-run mode for previewing operations
+- System integrity checks and validation
 - Comprehensive logging and status reporting
-- Safety checks and validation
 
 ## Installation
 
@@ -40,6 +41,9 @@ aptr list
 
 # Upgrade all rolling packages
 sudo aptr upgrade
+
+# Full system upgrade (stable + rolling)
+sudo aptr system-upgrade
 ```
 
 ## Usage
@@ -50,10 +54,12 @@ sudo aptr upgrade
 - `install <package>` - Install package from unstable (default) or stable with --stable flag
 - `list` - Display all rolling packages with version information
 - `upgrade` - Update all rolling packages to latest unstable versions
+- `system-upgrade` - Upgrade both stable and rolling packages
 - `roll <package>` - Convert installed package from stable to rolling (unstable)
 - `unroll <package>` - Remove package from rolling status
 - `search <query>` - Search packages in both stable and unstable repositories
 - `status` - Show system configuration and package statistics
+- `check` - Check system integrity and rolling package status
 
 ### Options
 
@@ -75,12 +81,13 @@ sudo aptr install --stable systemd
 
 # Regular maintenance
 sudo aptr -y upgrade
-sudo aptr --dry-run upgrade  # Preview changes
+sudo aptr --dry-run system-upgrade  # Preview full system upgrade
 
 # Package management
 aptr search docker
-sudo aptr roll --dry-run prometheus
+sudo aptr roll prometheus
 sudo aptr unroll python3-dev
+sudo aptr check  # Validate system integrity
 ```
 
 ## Configuration
@@ -90,13 +97,15 @@ aptr creates and manages the following files:
 - `/etc/apt/sources.list.d/aptr-unstable.list` - Unstable repository configuration
 - `/etc/apt/preferences.d/aptr-preferences` - APT pinning preferences
 - `/var/lib/aptr/rolling-packages` - Rolling package tracking
+- `/var/lib/aptr/rolling-dependencies` - Dependency relationships
 - `/var/log/aptr.log` - Operation logs
 
 ### APT Pinning Strategy
 
 - Stable packages: Priority 990 (highest)
-- Unstable packages: Priority 100 (default low)
 - Rolling packages: Priority 990 (high for selected packages)
+- Rolling dependencies: Priority 500 (medium - auto-pinned)
+- Unstable packages: Priority 200 (default low)
 
 ## Requirements
 

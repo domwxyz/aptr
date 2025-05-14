@@ -14,6 +14,7 @@ readonly VERSION="1.0.0"
 readonly UNSTABLE_SOURCES="/etc/apt/sources.list.d/aptr-unstable.list"
 readonly PREFERENCES_FILE="/etc/apt/preferences.d/aptr-preferences"
 readonly ROLLING_PACKAGES_FILE="/var/lib/aptr/rolling-packages"
+readonly ROLLING_DEPS_FILE="/var/lib/aptr/rolling-dependencies"
 readonly CONFIG_DIR="/var/lib/aptr"
 readonly LOCK_FILE="/var/run/aptr.lock"
 readonly LOG_FILE="/var/log/aptr.log"
@@ -142,11 +143,14 @@ setup_config() {
         log_verbose "Created configuration directory: $CONFIG_DIR"
     fi
     
-    if [[ ! -f "$ROLLING_PACKAGES_FILE" ]]; then
-        touch "$ROLLING_PACKAGES_FILE"
-        chmod 644 "$ROLLING_PACKAGES_FILE"
-        log_verbose "Created rolling packages tracking file: $ROLLING_PACKAGES_FILE"
-    fi
+    # Create all necessary files
+    for file in "$ROLLING_PACKAGES_FILE" "$ROLLING_DEPS_FILE"; do
+        if [[ ! -f "$file" ]]; then
+            touch "$file"
+            chmod 644 "$file"
+            log_verbose "Created $(basename "$file")"
+        fi
+    done
     
     # Ensure log directory exists
     mkdir -p "$(dirname "$LOG_FILE")"
@@ -229,7 +233,7 @@ Pin-Priority: 900
 # Unstable packages have very low priority by default
 Package: *
 Pin: release a=unstable
-Pin-Priority: 100
+Pin-Priority: 200
 
 # Prevent accidental installation from experimental
 Package: *
@@ -255,7 +259,7 @@ init_system() {
     setup_preferences
     
     log_info "Updating package lists..."
-    if ! apt update; then
+    if ! apt-get update; then
         log_error "Failed to update package lists"
         return 1
     fi
@@ -266,9 +270,16 @@ init_system() {
 
 add_to_rolling_list() {
     local package="$1"
+    local parent="${2:-}"  # Optional parent package
     
     if ! grep -q "^$package$" "$ROLLING_PACKAGES_FILE" 2>/dev/null; then
         echo "$package" >> "$ROLLING_PACKAGES_FILE"
+        
+        # Track dependency relationship if this is a dependency
+        if [[ -n "$parent" ]]; then
+            echo "$package:$parent" >> "$ROLLING_DEPS_FILE"
+        fi
+        
         log_verbose "Added $package to rolling packages list"
         return 0
     fi
@@ -317,6 +328,29 @@ remove_package_preference() {
     fi
 }
 
+pin_dependencies() {
+    local pkg=$1
+    local deps
+    deps=$(apt-cache depends "$pkg" | awk '/^\s*Depends:/ {print $2}' | grep -v "^<.*>$")
+
+    for dep in $deps; do
+        # Skip if already tracked as a main rolling package
+        if grep -qx "$dep" "$ROLLING_PACKAGES_FILE"; then
+            log_verbose "Dependency $dep already tracked as rolling package"
+            continue
+        fi
+        
+        # Check if it's already a dependency of another package
+        if ! grep -q "^$dep:" "$ROLLING_DEPS_FILE" 2>/dev/null; then
+            log_verbose "Pinning dependency $dep for $pkg"
+            create_package_preference "$dep" 500
+            add_to_rolling_list "$dep" "$pkg"
+        else
+            log_verbose "Dependency $dep already pinned for another package"
+        fi
+    done
+}
+
 install_package() {
     local package="$1"
     local from_unstable="${2:-auto}"
@@ -336,7 +370,7 @@ install_package() {
         # Check if package exists in unstable
         if ! package_exists "$package"; then
             log_warning "Package '$package' not found. Updating package lists..."
-            apt update
+            apt-get update
             if ! package_exists "$package"; then
                 log_error "Package '$package' not found in any repository"
                 return 1
@@ -351,9 +385,10 @@ install_package() {
         # Add to rolling list and create preference
         add_to_rolling_list "$package"
         create_package_preference "$package"
+        pin_dependencies "$package"
         
         # Build apt command with optional -y flag
-        local apt_cmd="apt install -t unstable"
+        local apt_cmd="apt-get install -t unstable"
         if [[ "$YES" == true ]]; then
             apt_cmd="$apt_cmd -y"
         fi
@@ -376,7 +411,7 @@ install_package() {
         fi
         
         # Build apt command with optional -y flag
-        local apt_cmd="apt install"
+        local apt_cmd="apt-get install"
         if [[ "$YES" == true ]]; then
             apt_cmd="$apt_cmd -y"
         fi
@@ -400,26 +435,46 @@ list_rolling_packages() {
     echo -e "${BOLD}================${NC}"
     
     local count=0
+    local main_packages=0
+    local dep_packages=0
+    
     while IFS= read -r package; do
         [[ -z "$package" ]] && continue
         ((count++))
         
-        # Get current version info
-        local version=""
-        local available=""
-        if command -v dpkg-query &>/dev/null && dpkg-query -W -f='${Version}' "$package" 2>/dev/null; then
-            version=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null || echo "Not installed")
-            available=$(apt-cache policy "$package" 2>/dev/null | grep -A1 "unstable" | tail -1 | awk '{print $1}' || echo "Unknown")
+        # Check if this is a dependency
+        local is_dependency=""
+        local parent_packages=""
+        if [[ -f "$ROLLING_DEPS_FILE" ]]; then
+            parent_packages=$(grep "^$package:" "$ROLLING_DEPS_FILE" | cut -d: -f2 | tr '\n' ' ')
+            if [[ -n "$parent_packages" ]]; then
+                is_dependency=" (dep of: ${parent_packages% })"
+                ((dep_packages++))
+            else
+                ((main_packages++))
+            fi
+        else
+            ((main_packages++))
         fi
         
-        printf "%-20s %s\n" "$package" "${version:0:40}"
-        if [[ "$VERBOSE" == true && -n "$available" && "$available" != "Unknown" ]]; then
-            printf "%-20s └─ Available: %s\n" "" "$available"
+        # Get current version info
+        local version=""
+        if command -v dpkg-query &>/dev/null; then
+            version=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null || echo "Not installed")
+        fi
+        
+        printf "%-25s %-35s %s\n" "$package" "${version:0:35}" "$is_dependency"
+        
+        if [[ "$VERBOSE" == true ]]; then
+            # Show available version
+            local available=$(apt-cache policy "$package" 2>/dev/null | grep -A1 "unstable" | tail -1 | awk '{print $1}' || echo "Unknown")
+            [[ -n "$available" && "$available" != "Unknown" ]] && \
+                printf "%-25s └─ Available: %s\n" "" "$available"
         fi
     done < "$ROLLING_PACKAGES_FILE"
     
     echo
-    log_info "Total rolling packages: $count"
+    log_info "Total: $count packages ($main_packages main, $dep_packages dependencies)"
 }
 
 upgrade_rolling_packages() {
@@ -429,7 +484,7 @@ upgrade_rolling_packages() {
     fi
     
     log_info "Updating package lists..."
-    apt update
+    apt-get update
     
     if [[ "$DRY_RUN" == true ]]; then
         log_info "[DRY RUN] Would upgrade the following rolling packages:"
@@ -442,7 +497,7 @@ upgrade_rolling_packages() {
     local upgraded_count=0
     
     # Build apt command with optional -y flag
-    local apt_cmd="apt install -t unstable"
+    local apt_cmd="apt-get install -t unstable"
     if [[ "$YES" == true ]]; then
         apt_cmd="$apt_cmd -y"
     fi
@@ -466,6 +521,60 @@ upgrade_rolling_packages() {
         log_warning "Upgraded $upgraded_count packages, but ${#failed_packages[@]} failed:"
         printf '  - %s\n' "${failed_packages[@]}"
     fi
+}
+
+system_upgrade() {
+    log_info "Performing full system upgrade (stable + rolling packages)..."
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "[DRY RUN] Would run full system upgrade"
+        log_info "[DRY RUN] - Update package lists"
+        log_info "[DRY RUN] - Upgrade stable packages"
+        log_info "[DRY RUN] - Upgrade rolling packages from unstable"
+        log_info "[DRY RUN] - Run autoremove for cleanup"
+        return 0
+    fi
+    
+    # Update package lists first
+    log_info "Updating package lists..."
+    if ! apt-get update; then
+        log_error "Failed to update package lists"
+        return 1
+    fi
+    
+    # Upgrade stable packages first (this respects our pinning)
+    log_info "Upgrading stable packages..."
+    local apt_cmd="apt-get upgrade"
+    if [[ "$YES" == true ]]; then
+        apt_cmd="$apt_cmd -y"
+    fi
+    
+    if ! DEBIAN_FRONTEND=noninteractive $apt_cmd; then
+        log_warning "Some stable packages failed to upgrade"
+        log_info "Continuing with rolling package upgrades..."
+    else
+        log_success "Stable packages upgraded successfully"
+    fi
+    
+    # Then upgrade rolling packages from unstable
+    log_info "Upgrading rolling packages from unstable..."
+    upgrade_rolling_packages
+    
+    # Handle any remaining issues and cleanup
+    log_info "Running final cleanup..."
+    local autoremove_cmd="apt-get autoremove"
+    if [[ "$YES" == true ]]; then
+        autoremove_cmd="$autoremove_cmd -y"
+    fi
+    
+    if DEBIAN_FRONTEND=noninteractive $autoremove_cmd; then
+        log_success "System cleanup completed"
+    else
+        log_warning "Autoremove encountered issues"
+    fi
+    
+    log_success "Full system upgrade completed"
+    log_info "Rolling packages: $(grep -c "^[^[:space:]]*$" "$ROLLING_PACKAGES_FILE" 2>/dev/null || echo 0)"
 }
 
 roll_package() {
@@ -495,7 +604,7 @@ roll_package() {
     log_info "Checking if $package is available in unstable..."
     if ! package_exists "$package"; then
         log_warning "Package '$package' not found. Updating package lists..."
-        apt update
+        apt-get update
         if ! package_exists "$package"; then
             log_error "Package '$package' not found in any repository"
             return 1
@@ -519,9 +628,10 @@ roll_package() {
     # Add to rolling list and create preference
     add_to_rolling_list "$package"
     create_package_preference "$package"
+    pin_dependencies "$package"
     
     # Build apt command with optional -y flag
-    local apt_cmd="apt install -t unstable"
+    local apt_cmd="apt-get install -t unstable"
     if [[ "$YES" == true ]]; then
         apt_cmd="$apt_cmd -y"
     fi
@@ -548,6 +658,13 @@ unroll_package() {
     
     if [[ "$DRY_RUN" == true ]]; then
         log_info "[DRY RUN] Would remove $package from rolling status"
+        # Show which dependencies would be cleaned up
+        if [[ -f "$ROLLING_DEPS_FILE" ]]; then
+            local deps_to_remove=$(grep ":$package$" "$ROLLING_DEPS_FILE" | cut -d: -f1)
+            if [[ -n "$deps_to_remove" ]]; then
+                log_info "[DRY RUN] Would also remove dependencies: $deps_to_remove"
+            fi
+        fi
         return 0
     fi
     
@@ -557,8 +674,32 @@ unroll_package() {
         return 1
     fi
     
+    # Remove package from rolling list
     remove_from_rolling_list "$package"
     remove_package_preference "$package"
+    
+    # Handle dependencies
+    if [[ -f "$ROLLING_DEPS_FILE" ]]; then
+        # Find dependencies that were added for this package
+        local deps_to_check=$(grep ":$package$" "$ROLLING_DEPS_FILE" | cut -d: -f1)
+        
+        for dep in $deps_to_check; do
+            # Check if this dependency is needed by other rolling packages
+            local other_parents=$(grep "^$dep:" "$ROLLING_DEPS_FILE" | grep -v ":$package$" | wc -l)
+            
+            if [[ $other_parents -eq 0 ]]; then
+                log_info "Removing dependency $dep (no longer needed)"
+                remove_from_rolling_list "$dep"
+                remove_package_preference "$dep"
+                # Remove from dependencies file
+                sed -i "/^$dep:$package$/d" "$ROLLING_DEPS_FILE"
+            else
+                log_verbose "Keeping dependency $dep (still needed by other packages)"
+                # Just remove this specific dependency relationship
+                sed -i "/^$dep:$package$/d" "$ROLLING_DEPS_FILE"
+            fi
+        done
+    fi
     
     log_success "Removed $package from rolling status"
     log_info "The package remains installed. Use 'apt remove $package' to uninstall it."
@@ -566,24 +707,23 @@ unroll_package() {
 }
 
 search_packages() {
-    local query="$1"
-    
-    if [[ -z "$query" ]]; then
-        log_error "Search query required"
-        return 1
-    fi
-    
-    log_info "Searching for packages matching '$query'..."
-    
-    # Search in both stable and unstable
-    echo -e "${BOLD}Stable packages:${NC}"
-    apt-cache search "$query" | grep -v "^WARNING" | head -10
-    
+    local query=$1
+    [[ -z $query ]] && { log_error "Search query required"; return 1; }
+
+    log_info "Searching for '$query'…"
+
+    echo -e "${BOLD}Stable:${NC}"
+    apt-cache search "$query" | head -10
+
     echo
-    echo -e "${BOLD}Unstable packages:${NC}"
-    apt-cache search -t unstable "$query" 2>/dev/null | grep -v "^WARNING" | head -10 || \
-    apt-cache search "$query" | grep -v "^WARNING" | head -10
+    echo -e "${BOLD}Unstable:${NC}"
+    apt-cache --names-only search "$query" \
+      | awk '{print $1}' \
+      | xargs -r apt-cache policy \
+      | awk '/^\S/ {pkg=$1} /unstable/ && /Candidate:/ {print pkg}' \
+      | head -10
 }
+
 
 show_status() {
     echo -e "${BOLD}$PROGRAM_NAME Status:${NC}"
@@ -627,6 +767,212 @@ show_status() {
     fi
 }
 
+validate_dependencies() {
+    local issues_found=0
+    
+    if [[ ! -f "$ROLLING_DEPS_FILE" ]]; then
+        return 0
+    fi
+    
+    log_verbose "Validating dependency relationships..."
+    
+    # Check for orphaned dependencies
+    while IFS=: read -r dep parent; do
+        [[ -z "$dep" || -z "$parent" ]] && continue
+        
+        # Check if parent still exists as rolling package
+        if ! grep -qx "$parent" "$ROLLING_PACKAGES_FILE"; then
+            log_warning "Orphaned dependency: $dep (parent $parent no longer rolling)"
+            ((issues_found++))
+            
+            # Auto-cleanup orphaned deps
+            if [[ "$FORCE" == true ]]; then
+                log_info "Auto-removing orphaned dependency $dep"
+                remove_from_rolling_list "$dep"
+                remove_package_preference "$dep"
+                sed -i "/^$dep:$parent$/d" "$ROLLING_DEPS_FILE"
+            fi
+        fi
+    done < "$ROLLING_DEPS_FILE"
+    
+    return $issues_found
+}
+
+check_system() {
+    log_info "Performing system checks..."
+    local issues_found=0
+    
+    # Check 1: Verify aptr is initialized
+    log_verbose "Checking system initialization status..."
+    if [[ ! -f "$UNSTABLE_SOURCES" || ! -f "$PREFERENCES_FILE" ]]; then
+        log_error "System not properly initialized (run '$PROGRAM_NAME init')"
+        log_verbose "Missing files: $([ ! -f "$UNSTABLE_SOURCES" ] && echo "$UNSTABLE_SOURCES ") $([ ! -f "$PREFERENCES_FILE" ] && echo "$PREFERENCES_FILE")"
+        ((issues_found++))
+    else
+        log_success "System properly initialized"
+        log_verbose "Found: $UNSTABLE_SOURCES and $PREFERENCES_FILE"
+    fi
+    
+    # Check 2: Verify rolling packages file exists and is readable
+    log_verbose "Checking rolling packages file..."
+    if [[ ! -f "$ROLLING_PACKAGES_FILE" ]]; then
+        log_warning "Rolling packages file not found"
+        log_verbose "Expected location: $ROLLING_PACKAGES_FILE"
+        ((issues_found++))
+    else
+        log_success "Rolling packages file exists"
+        local package_count=$(grep -c "^[^[:space:]]*$" "$ROLLING_PACKAGES_FILE" 2>/dev/null || echo 0)
+        log_verbose "Found $package_count rolling packages in $ROLLING_PACKAGES_FILE"
+    fi
+    
+    # Check 3: Check for broken dependencies
+    log_verbose "Checking for broken dependencies using apt-check..."
+    local broken_deps=$(apt-check 2>&1 | grep -o "[0-9]\+;[0-9]\+" | cut -d';' -f2)
+    if [[ -n "$broken_deps" && "$broken_deps" -gt 0 ]]; then
+        log_error "Found $broken_deps broken dependencies"
+        ((issues_found++))
+        log_info "Run 'sudo apt --fix-broken install' to fix broken dependencies"
+    else
+        log_success "No broken dependencies found"
+        log_verbose "apt-check reports system is clean"
+    fi
+
+    log_verbose "Validating dependency relationships..."
+    validate_dependencies
+    local dep_issues=$?
+    if [[ $dep_issues -gt 0 ]]; then
+        ((issues_found += dep_issues))
+        log_info "Run with --force to auto-cleanup orphaned dependencies"
+    fi
+    
+    # Check 4: Verify rolling packages are actually installed
+    log_verbose "Verifying installation status of rolling packages..."
+    if [[ -f "$ROLLING_PACKAGES_FILE" && -s "$ROLLING_PACKAGES_FILE" ]]; then
+        local missing_packages=()
+        local total_checked=0
+        while IFS= read -r package; do
+            [[ -z "$package" ]] && continue
+            ((total_checked++))
+            log_verbose "Checking installation status of $package..."
+            if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
+                missing_packages+=("$package")
+                log_verbose "$package: NOT INSTALLED"
+            else
+                log_verbose "$package: installed"
+            fi
+        done < "$ROLLING_PACKAGES_FILE"
+        
+        if [[ ${#missing_packages[@]} -gt 0 ]]; then
+            log_warning "Found ${#missing_packages[@]} rolling packages that are not installed:"
+            printf '  - %s\n' "${missing_packages[@]}"
+            ((issues_found++))
+        else
+            log_success "All rolling packages are properly installed"
+            log_verbose "Verified $total_checked rolling packages"
+        fi
+    else
+        log_verbose "No rolling packages file or file is empty - skipping installation check"
+    fi
+    
+    # Check 5: Verify preference files for rolling packages exist
+    log_verbose "Checking preference files for rolling packages..."
+    if [[ -f "$ROLLING_PACKAGES_FILE" && -s "$ROLLING_PACKAGES_FILE" ]]; then
+        local missing_prefs=()
+        while IFS= read -r package; do
+            [[ -z "$package" ]] && continue
+            local pref_file="/etc/apt/preferences.d/aptr-${package}"
+            log_verbose "Checking preference file for $package: $pref_file"
+            if [[ ! -f "$pref_file" ]]; then
+                missing_prefs+=("$package")
+                log_verbose "$package: preference file MISSING"
+            else
+                log_verbose "$package: preference file exists"
+            fi
+        done < "$ROLLING_PACKAGES_FILE"
+        
+        if [[ ${#missing_prefs[@]} -gt 0 ]]; then
+            log_warning "Found ${#missing_prefs[@]} rolling packages missing preference files:"
+            printf '  - %s\n' "${missing_prefs[@]}"
+            ((issues_found++))
+            log_info "Run '$PROGRAM_NAME roll <package>' to recreate missing preferences"
+        else
+            log_success "All rolling packages have proper preference files"
+        fi
+    else
+        log_verbose "No rolling packages to check preference files for"
+    fi
+    
+    # Check 6: Look for orphaned preference files
+    log_verbose "Scanning for orphaned preference files in /etc/apt/preferences.d..."
+    local orphaned_prefs=()
+    if [[ -d "/etc/apt/preferences.d" ]]; then
+        for pref_file in /etc/apt/preferences.d/aptr-*; do
+            [[ ! -f "$pref_file" ]] && continue
+            local package=$(basename "$pref_file" | sed 's/^aptr-//')
+            log_verbose "Examining preference file: $pref_file (package: $package)"
+            if [[ ! "$pref_file" =~ aptr-preferences$ ]] && ! grep -q "^$package$" "$ROLLING_PACKAGES_FILE" 2>/dev/null; then
+                orphaned_prefs+=("$package")
+                log_verbose "$package: ORPHANED preference file found"
+            else
+                log_verbose "$package: preference file properly tracked"
+            fi
+        done
+        
+        if [[ ${#orphaned_prefs[@]} -gt 0 ]]; then
+            log_warning "Found ${#orphaned_prefs[@]} orphaned preference files:"
+            printf '  - %s\n' "${orphaned_prefs[@]}"
+            ((issues_found++))
+            log_info "Run '$PROGRAM_NAME unroll <package>' to clean up orphaned preferences"
+        else
+            log_success "No orphaned preference files found"
+            log_verbose "All aptr preference files are properly tracked"
+        fi
+    else
+        log_verbose "/etc/apt/preferences.d directory not found"
+        ((issues_found++))
+    fi
+
+    # Check 7: Test repository connectivity
+    log_verbose "Testing repository connectivity to unstable sources..."
+    log_verbose "Using sources file: $UNSTABLE_SOURCES"
+    if timeout 10 apt-get update -qq -o Dir::Etc::sourcelist="$UNSTABLE_SOURCES" 2>/dev/null; then
+        log_success "Unstable repository is reachable"
+        log_verbose "Successfully updated package lists from unstable"
+    else
+        log_error "Cannot reach unstable repository"
+        log_verbose "Failed to update from $UNSTABLE_SOURCES"
+        ((issues_found++))
+    fi
+    
+    # Check 8: Verify preference files are properly formatted
+    log_verbose "Validating preference file syntax and format..."
+    local checked_prefs=0
+    for pref_file in /etc/apt/preferences.d/aptr-*; do
+        [[ ! -f "$pref_file" ]] && continue
+        ((checked_prefs++))
+        log_verbose "Validating syntax of: $pref_file"
+        # Check for basic structure
+        if ! grep -q "^Package:" "$pref_file" || ! grep -q "^Pin:" "$pref_file" || ! grep -q "^Pin-Priority:" "$pref_file"; then
+            log_warning "Preference file $pref_file appears malformed"
+            log_verbose "Missing required fields in $pref_file"
+            ((issues_found++))
+        else
+            log_verbose "$pref_file: syntax appears valid"
+        fi
+    done
+    log_verbose "Checked $checked_prefs preference files for syntax"
+    
+    # Summary
+    echo
+    log_verbose "System check completed. Scanned $checked_prefs preference files and $(grep -c "^[^[:space:]]*$" "$ROLLING_PACKAGES_FILE" 2>/dev/null || echo 0) rolling packages"
+    if [[ $issues_found -eq 0 ]]; then
+        log_success "System check completed successfully - no issues found"
+    else
+        log_warning "System check completed with $issues_found issue(s) found"
+        return 1
+    fi
+}
+
 # Help function
 show_help() {
     cat << EOF
@@ -653,10 +999,12 @@ ${BOLD}COMMANDS:${NC}
     install -s <pkg>    Install package from stable (equivalent to apt install)
     list               List all rolling packages with versions
     upgrade            Upgrade all rolling packages to latest unstable
+    system-upgrade     Upgrade both stable and rolling packages (full system)
     roll <pkg>         Convert installed package from stable to rolling (unstable)
     unroll <pkg>       Remove package from rolling status
     search <query>     Search for packages in both stable and unstable
     status             Show system status and configuration
+    check              Check system integrity and rolling package status
     help               Show this help message
 
 ${BOLD}EXAMPLES:${NC}
@@ -666,11 +1014,14 @@ ${BOLD}EXAMPLES:${NC}
     $PROGRAM_NAME -y install golang        # Install golang from unstable (no prompts)
     $PROGRAM_NAME install --stable systemd # Install systemd from stable
     $PROGRAM_NAME list                     # Show all rolling packages
-    $PROGRAM_NAME -y upgrade               # Upgrade all rolling packages (no prompts)
+    $PROGRAM_NAME upgrade -y               # Upgrade all rolling packages (no prompts)
+    $PROGRAM_NAME upgrade --dry-run        # Preview upgrade actions
+    $PROGRAM_NAME system-upgrade           # Full system upgrade (stable + rolling)
+    $PROGRAM_NAME system-upgrade --dry-run # Preview full system upgrade
     $PROGRAM_NAME search golang            # Search for golang packages
     $PROGRAM_NAME roll python3-dev         # Convert python3-dev to rolling
     $PROGRAM_NAME unroll python3-dev       # Stop rolling python3-dev
-    $PROGRAM_NAME --dry-run upgrade        # Preview upgrade actions
+    $PROGRAM_NAME check -v                 # Check system integrity
 
 ${BOLD}FILES:${NC}
     $UNSTABLE_SOURCES    Unstable repository configuration
@@ -767,7 +1118,7 @@ main() {
     
     # Set up lock for operations that modify system
     case "$command" in
-        init|install|upgrade|unroll)
+        init|install|upgrade|system-upgrade|roll|unroll)
             check_root
             check_lock
             ;;
@@ -794,6 +1145,13 @@ main() {
             fi
             upgrade_rolling_packages
             ;;
+        "system-upgrade")
+            if ! confirm_action "This will upgrade both stable and rolling packages. Continue?"; then
+                log_info "System upgrade cancelled"
+                exit 0
+            fi
+            system_upgrade
+            ;;
         "roll")
             if [[ -z "$2" ]]; then
                 log_error "Package name required for roll command"
@@ -817,6 +1175,9 @@ main() {
             ;;
         "status")
             show_status
+            ;;
+        "check")
+            check_system
             ;;
         "help"|"-h"|"--help")
             show_help
