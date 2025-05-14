@@ -108,6 +108,24 @@ check_lock() {
     }
 }
 
+check_apt_lock() {
+    local lock_files=(
+        "/var/lib/apt/lists/lock"
+        "/var/cache/apt/archives/lock"
+        "/var/lib/dpkg/lock"
+        "/var/lib/dpkg/lock-frontend"
+    )
+    
+    for lock_file in "${lock_files[@]}"; do
+        if fuser "$lock_file" >/dev/null 2>&1; then
+            log_error "APT is locked by another process (${lock_file})"
+            log_info "Wait for other package operations to complete, or run 'sudo killall apt apt-get'"
+            return 1
+        fi
+    done
+    return 0
+}
+
 validate_package_name() {
     local package="$1"
     
@@ -306,6 +324,7 @@ init_system() {
     setup_preferences
     
     log_info "Updating package lists..."
+    check_apt_lock || return 1
     if ! apt-get update; then
         log_error "Failed to update package lists"
         return 1
@@ -439,6 +458,7 @@ install_package() {
         # Check if package exists in unstable
         if ! package_exists "$package"; then
             log_warning "Package '$package' not found. Updating package lists..."
+            check_apt_lock || return 1
             apt-get update
             if ! package_exists "$package"; then
                 log_error "Package '$package' not found in any repository"
@@ -463,6 +483,7 @@ install_package() {
         fi
         
         # Install with specific target
+        check_apt_lock || return 1
         if DEBIAN_FRONTEND=noninteractive $apt_cmd "$package"; then
             log_success "Successfully installed $package from unstable"
         else
@@ -485,6 +506,7 @@ install_package() {
             apt_cmd="$apt_cmd -y"
         fi
         
+        check_apt_lock || return 1
         if DEBIAN_FRONTEND=noninteractive $apt_cmd "$package"; then
             log_success "Successfully installed $package from stable"
         else
@@ -553,6 +575,7 @@ upgrade_rolling_packages() {
     fi
     
     log_info "Updating package lists..."
+    check_apt_lock || return 1
     apt-get update
     
     if [[ "$DRY_RUN" == true ]]; then
@@ -575,6 +598,7 @@ upgrade_rolling_packages() {
         [[ -z "$package" ]] && continue
         
         log_verbose "Checking $package for updates..."
+        check_apt_lock || return 1
         if DEBIAN_FRONTEND=noninteractive $apt_cmd "$package"; then
             ((upgraded_count++))
             log_success "Upgraded $package"
@@ -606,6 +630,7 @@ upgrade_system() {
     
     # Update package lists first
     log_info "Updating package lists..."
+    check_apt_lock || return 1
     if ! apt-get update; then
         log_error "Failed to update package lists"
         return 1
@@ -613,6 +638,7 @@ upgrade_system() {
     
     # Upgrade stable packages first (this respects our pinning)
     log_info "Upgrading stable packages..."
+    check_apt_lock || return 1
     local apt_cmd="apt-get upgrade"
     if [[ "$YES" == true ]]; then
         apt_cmd="$apt_cmd -y"
@@ -636,6 +662,7 @@ upgrade_system() {
         autoremove_cmd="$autoremove_cmd -y"
     fi
     
+    check_apt_lock || return 1
     if DEBIAN_FRONTEND=noninteractive $autoremove_cmd; then
         log_success "System cleanup completed"
     else
@@ -673,6 +700,7 @@ roll_package() {
     log_info "Checking if $package is available in unstable..."
     if ! package_exists "$package"; then
         log_warning "Package '$package' not found. Updating package lists..."
+        check_apt_lock || return 1
         apt-get update
         if ! package_exists "$package"; then
             log_error "Package '$package' not found in any repository"
@@ -707,6 +735,7 @@ roll_package() {
     
     # Upgrade to unstable version
     log_info "Upgrading $package to unstable version..."
+    check_apt_lock || return 1
     if DEBIAN_FRONTEND=noninteractive $apt_cmd "$package"; then
         log_success "Successfully converted $package to rolling and upgraded from unstable"
         log_info "Package $package will now be updated during '$PROGRAM_NAME upgrade' operations"
@@ -1004,6 +1033,7 @@ check_system() {
     # Check 7: Test repository connectivity
     log_verbose "Testing repository connectivity to unstable sources..."
     log_verbose "Using sources file: $UNSTABLE_SOURCES"
+    check_apt_lock || return 1
     if timeout 10 apt-get update -qq -o Dir::Etc::sourcelist="$UNSTABLE_SOURCES" 2>/dev/null; then
         log_success "Unstable repository is reachable"
         log_verbose "Successfully updated package lists from unstable"
