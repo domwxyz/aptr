@@ -2,7 +2,7 @@
 
 # aptr - APT Rolling Package Manager
 # Version: 1.0.0
-# A sophisticated tool for managing mixed Debian systems with stable core and rolling development packages
+# A tool for managing mixed source Debian systems with both stable and unstable (Sid) packages
 # Author: domwxyz
 # License: GPLv3
 
