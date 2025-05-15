@@ -19,6 +19,10 @@ readonly CONFIG_DIR="/var/lib/aptr"
 readonly LOCK_FILE="/var/run/aptr.lock"
 readonly LOG_FILE="/var/log/aptr.log"
 
+# Parsed arguments
+COMMAND=""
+COMMAND_ARGS=()
+
 # Default configuration
 VERBOSE=false
 DRY_RUN=false
@@ -1214,81 +1218,66 @@ show_version() {
     echo "$PROGRAM_NAME v$VERSION"
 }
 
-process_flag() {
-    case "$1" in
-        -v|--verbose)
-            VERBOSE=true
-            return 0
-            ;;
-        -n|--dry-run)
-            DRY_RUN=true
-            return 0
-            ;;
-        -f|--force)
-            FORCE=true
-            return 0
-            ;;
-        -y|--yes)
-            YES=true
-            return 0
-            ;;
-        -s|--stable)
-            STABLE=true
-            return 0
-            ;;
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        --version)
-            show_version
-            exit 0
-            ;;
-        -*)
-            log_error "Unknown option: $1"
-            show_help
-            exit 1
-            ;;
-        *)
-            return 1  # Not a flag
-            ;;
-    esac
-}
-
-parse_options() {
-    local command=""
-    local args=()
+parse_arguments() {
+    COMMAND=""
+    COMMAND_ARGS=()
     
-    # Single pass through all arguments
     while [[ $# -gt 0 ]]; do
-        if process_flag "$1"; then
-            # Flag was processed, continue
-            shift
-        else
-            # Not a flag - must be command or argument
-            if [[ -z "$command" ]]; then
-                command="$1"
-            else
-                args+=("$1")
-            fi
-            shift
-        fi
+        case "$1" in
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            -y|--yes)
+                YES=true
+                shift
+                ;;
+            -s|--stable)
+                STABLE=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+            *)
+                # Not a flag - must be command or argument
+                if [[ -z "$COMMAND" ]]; then
+                    COMMAND="$1"
+                else
+                    COMMAND_ARGS+=("$1")
+                fi
+                shift
+                ;;
+        esac
     done
     
-    echo "$command" "${args[@]}"
+    # Default to help if no command provided
+    COMMAND="${COMMAND:-help}"
 }
 
-# Main function
 main() {
-    # Parse options and get remaining arguments
-    local args
-    args=$(parse_options "$@")
-    set -- $args
-    
-    local command="${1:-help}"
+    parse_arguments "$@"
     
     # Set up lock for operations that modify system
-    case "$command" in
+    case "$COMMAND" in
         init|install|upgrade|system-upgrade|roll|unroll)
             check_root
             check_lock
@@ -1296,25 +1285,25 @@ main() {
     esac
 
     # Validate package names for commands that use them
-    case "$command" in
+    case "$COMMAND" in
         "install"|"roll"|"unroll"|"search")
-            if [[ -n "$2" ]] && ! validate_package_name "$2"; then
-                log_error "Invalid package name: $2"
+            if [[ -n "${COMMAND_ARGS[0]}" ]] && ! validate_package_name "${COMMAND_ARGS[0]}"; then
+                log_error "Invalid package name: ${COMMAND_ARGS[0]}"
                 exit 1
             fi
             ;;
     esac
     
-    case "$command" in
+    case "$COMMAND" in
         "init")
             init_system
             ;;
         "install")
-            if [[ -z "$2" ]]; then
+            if [[ -z "${COMMAND_ARGS[0]}" ]]; then
                 log_error "Package name required for install command"
                 exit 1
             fi
-            install_package "$2"
+            install_package "${COMMAND_ARGS[0]}"
             ;;
         "list")
             list_rolling_packages
@@ -1334,25 +1323,25 @@ main() {
             upgrade_system
             ;;
         "roll")
-            if [[ -z "$2" ]]; then
+            if [[ -z "${COMMAND_ARGS[0]}" ]]; then
                 log_error "Package name required for roll command"
                 exit 1
             fi
-            roll_package "$2"
+            roll_package "${COMMAND_ARGS[0]}"
             ;;
         "unroll")
-            if [[ -z "$2" ]]; then
+            if [[ -z "${COMMAND_ARGS[0]}" ]]; then
                 log_error "Package name required for unroll command"
                 exit 1
             fi
-            unroll_package "$2"
+            unroll_package "${COMMAND_ARGS[0]}"
             ;;
         "search")
-            if [[ -z "$2" ]]; then
+            if [[ -z "${COMMAND_ARGS[0]}" ]]; then
                 log_error "Search query required for search command"
                 exit 1
             fi
-            search_packages "$2"
+            search_packages "${COMMAND_ARGS[0]}"
             ;;
         "status")
             show_status
@@ -1364,7 +1353,7 @@ main() {
             show_help
             ;;
         *)
-            log_error "Unknown command: $command"
+            log_error "Unknown command: $COMMAND"
             show_help
             exit 1
             ;;
