@@ -275,7 +275,21 @@ setup_unstable_sources() {
     # Detect current mirror and architecture
     local current_sources="/etc/apt/sources.list"
     local debian_mirror=""
-    local components="main contrib non-free non-free-firmware"
+
+    # Detect Debian version to determine appropriate components
+    local codename=$(detect_debian_codename)
+    local components="main contrib non-free"
+    
+    # Add non-free-firmware for bookworm (Debian 12) and newer
+    case "$codename" in
+        bookworm|trixie|forky|sid)
+            components="main contrib non-free non-free-firmware"
+            log_verbose "Using components with non-free-firmware for $codename"
+            ;;
+        *)
+            log_verbose "Using traditional components for $codename (no non-free-firmware)"
+            ;;
+    esac
     
     # Try to detect mirror from existing sources
     if [[ -f "$current_sources" ]]; then
