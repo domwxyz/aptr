@@ -175,16 +175,20 @@ package_exists() {
 is_virtual_package() {
     local package="$1"
     
-    # Virtual packages show "Package: <name>" followed by "Reverse Depends:" but no "Description:"
-    if apt-cache show "$package" 2>/dev/null | grep -q "^Package: $package$"; then
-        # Real package found
-        return 1
-    else
-        # Check if it's provided by other packages (virtual)
-        apt-cache search --names-only "^$package$" 2>/dev/null | grep -q "^$package " && return 1
-        apt-cache showpkg "$package" 2>/dev/null | grep -q "^Reverse Provides:" && return 0
-        return 1
+    # If apt-cache show succeeds, it's a real package with metadata
+    if apt-cache show "$package" &>/dev/null; then
+        return 1  # Not virtual (real package)
     fi
+    
+    # Check if it's provided by other packages (virtual package)
+    # Look for "Reverse Provides:" section with actual content
+    local showpkg_output=$(apt-cache showpkg "$package" 2>/dev/null)
+    if [[ -n "$showpkg_output" ]] && echo "$showpkg_output" | grep -A 1 "^Reverse Provides:" | tail -1 | grep -q "[^[:space:]]"; then
+        return 0  # Virtual package (provided by others)
+    fi
+    
+    # Package doesn't exist at all
+    return 1  # Treat non-existent as non-virtual
 }
 
 confirm_action() {
@@ -432,7 +436,7 @@ create_package_preference() {
     validate_package_name "$package" || return 1
     
     # Sanitize package name for filename (remove any remaining unsafe chars)
-    local safe_package="${package//[^a-zA-Z0-9+._-]/}"
+    local safe_package="${package//[^a-zA-Z0-9+.\-_]/}"
     local package_pref_file="/etc/apt/preferences.d/aptr-${safe_package}"
     
     # Double-check the final path is safe
@@ -490,7 +494,7 @@ remove_package_preference() {
 pin_dependencies() {
     local pkg=$1
     local deps
-    deps=$(apt-cache depends "$pkg" | awk '/^\s*Depends:/ {print $2}' | grep -v "^<.*>$")
+    deps=$(apt-cache depends "$pkg" | awk '/^[[:space:]]*Depends:/ {print $2}' | grep -v "^<.*>$")
 
     for dep in $deps; do
         # Skip if already tracked as a main rolling package
