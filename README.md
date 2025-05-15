@@ -6,6 +6,15 @@ A tool for managing mixed Debian systems with stable core packages and selective
 
 **aptr** provides granular control over which packages track Debian's unstable branch while maintaining a stable system foundation. Instead of running a full unstable system or manual APT pinning, aptr automates the configuration and management of mixed package sources.
 
+## How It Works
+
+aptr implements a simple two-tier system:
+
+- **Rolling packages** (managed by aptr): Always install/upgrade to the latest version from Debian unstable
+- **Non-rolling packages**: Stay on stable versions unless explicitly upgraded
+
+When you mark a package as "rolling" with `aptr install` or `aptr roll`, it will always prefer unstable over stable, even if stable has a newer version. This ensures your development tools stay cutting-edge while your system remains stable.
+
 ## Features
 
 - Automatic APT preferences configuration with intelligent pinning
@@ -102,8 +111,8 @@ aptr creates and manages the following files:
 
 ### APT Pinning Strategy
 
-- Stable packages: Priority 990 (highest)
-- Rolling packages: Priority 990 (high for selected packages)
+- **Rolling packages: Priority 995 (highest - always track unstable)**
+- **Stable packages: Priority 990 (high - default for non-rolling)**
 - Rolling dependencies: Priority 500 (medium - auto-pinned)
 - Unstable packages: Priority 200 (default low)
 
