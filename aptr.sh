@@ -121,10 +121,18 @@ check_apt_lock() {
     )
     
     for lock_file in "${lock_files[@]}"; do
-        if fuser "$lock_file" >/dev/null 2>&1; then
-            log_error "APT is locked by another process (${lock_file})"
-            log_info "Wait for other package operations to complete, or run 'sudo killall apt apt-get'"
-            return 1
+        # Check if lock file exists
+        if [[ -f "$lock_file" ]]; then
+            # Try to read PID from lock file
+            local pid
+            pid=$(cat "$lock_file" 2>/dev/null)
+            
+            # Check if we got a valid PID and if that process exists
+            if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ && -d "/proc/$pid" ]]; then
+                log_error "APT is locked by another process (${lock_file}, PID: $pid)"
+                log_info "Wait for other package operations to complete, or run 'sudo killall apt apt-get'"
+                return 1
+            fi
         fi
     done
     return 0
@@ -698,35 +706,27 @@ upgrade_rolling_packages() {
         return 0
     fi
     
-    log_info "Upgrading rolling packages..."
-    local failed_packages=()
-    local upgraded_count=0
+    log_info "Upgrading all rolling packages in a single transaction..."
     
-    # Build apt command with optional -y flag
+    # Read all packages into an array
+    local packages_to_upgrade=()
+    while IFS= read -r package; do
+        [[ -n "$package" ]] && packages_to_upgrade+=("$package")
+    done < "$ROLLING_PACKAGES_FILE"
+    
+    # Build apt command
     local apt_cmd="apt-get install -t unstable"
     if [[ "$YES" == true ]]; then
         apt_cmd="$apt_cmd -y"
     fi
     
-    while IFS= read -r package; do
-        [[ -z "$package" ]] && continue
-        
-        log_verbose "Checking $package for updates..."
-        check_apt_lock || return 1
-        if DEBIAN_FRONTEND=noninteractive $apt_cmd "$package"; then
-            ((upgraded_count++))
-            log_success "Upgraded $package"
-        else
-            failed_packages+=("$package")
-            log_warning "Failed to upgrade $package"
-        fi
-    done < "$ROLLING_PACKAGES_FILE"
-    
-    if [[ ${#failed_packages[@]} -eq 0 ]]; then
-        log_success "All $upgraded_count rolling packages upgraded successfully"
+    # Execute upgrade
+    check_apt_lock || return 1
+    if DEBIAN_FRONTEND=noninteractive $apt_cmd "${packages_to_upgrade[@]}"; then
+        log_success "Successfully upgraded all rolling packages"
     else
-        log_warning "Upgraded $upgraded_count packages, but ${#failed_packages[@]} failed:"
-        printf '  - %s\n' "${failed_packages[@]}"
+        log_error "Failed to upgrade rolling packages"
+        return 1
     fi
 }
 
