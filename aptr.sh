@@ -264,12 +264,12 @@ detect_debian_codename() {
             10*) codename="buster" ;;
             9*) codename="stretch" ;;
             8*) codename="jessie" ;;
-            *) codename="bookworm" ;;  # Default for unknown versions
+            *) codename="stable" ;;  # Default for unknown versions
         esac
     fi
     
     # Final fallback
-    echo "${codename:-bookworm}"
+    echo "${codename:-stable}"
 }
 
 setup_unstable_sources() {
