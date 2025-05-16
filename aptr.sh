@@ -436,7 +436,7 @@ create_package_preference() {
     validate_package_name "$package" || return 1
     
     # Sanitize package name for filename (remove any remaining unsafe chars)
-    local safe_package="${package//[^a-zA-Z0-9+.\-_]/}"
+    local safe_package="${package//[^a-zA-Z0-9+._-]/}"
     local package_pref_file="/etc/apt/preferences.d/aptr-${safe_package}"
     
     # Double-check the final path is safe
